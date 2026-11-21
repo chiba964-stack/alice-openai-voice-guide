@@ -1,7 +1,5 @@
-"""HTTPS-вебхук приватного навыка Алисы для Vercel.
-
-Зависимостей, кроме стандартной библиотеки Python, нет. Все персональные
-настройки передаются через переменные окружения Vercel.
+"""HTTPS webhook приватного навыка Алисы для Vercel.
+Gemini Interactions API, стандартная библиотека Python.
 """
 
 import json
@@ -13,43 +11,38 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-
-API_URL = "https://api.openai.com/v1/responses"
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
-MAX_ANSWER_CHARS = 900  # Лимит поля response.text у Алисы: 1024.
-OPENAI_TIME_BUDGET_SECONDS = 3.6  # У Яндекс Диалогов всего 4,5 с, включая сеть.
+API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+MAX_ANSWER_CHARS = 900
+TIME_BUDGET_SECONDS = 3.65
 
 INSTRUCTIONS = (
     "Ты голосовой помощник в приватном навыке Алисы. Отвечай на русском языке "
-    "естественно и кратко: обычно одно-два предложения, до 40 слов. Пиши только текст для "
-    "произнесения вслух, без Markdown, списков, ссылок и эмодзи. Если данных "
-    "недостаточно, честно скажи об этом. Учитывай сказанное в этой беседе, "
-    "но не обещай помнить его после выхода из навыка. Не заявляй, что выполнил "
-    "действие во внешнем сервисе, если оно не было выполнено."
+    "естественно и кратко: обычно одно-два предложения, до 40 слов. Пиши только текст "
+    "для произнесения вслух, без Markdown, списков, ссылок и эмодзи. Если данных "
+    "недостаточно, честно скажи об этом. Учитывай предыдущие сообщения этой беседы. "
+    "Не заявляй, что выполнил действие во внешнем сервисе, если оно не было выполнено."
 )
 SEARCH_PROMPT = (
-    "Для этого вопроса используй веб-поиск. Ответь на русском кратко, "
-    "только по найденным данным. Назови источник обычными словами. "
-    "Не произноси адреса сайтов. Если подтверждения нет, скажи об этом."
+    "Используй Google Search для проверки актуальных сведений. Ответь на русском кратко, "
+    "только по найденным данным. Назови источник обычными словами, не произноси адреса сайтов. "
+    "Если подтверждения нет, прямо скажи об этом."
 )
 SEARCH_FOLLOWUP = ("что нашлось", "что нашёл", "ну что нашёл", "ну что нашлось")
 
 
-class OpenAIError(Exception):
-    """Ошибка обращения к OpenAI API."""
+class GeminiError(Exception):
+    """Ошибка обращения к Gemini API."""
 
 
 def _api_request(method, url, key, payload=None, timeout=2.5):
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method=method,
-        headers={
-            "Authorization": "Bearer " + key,
-            "Content-Type": "application/json",
-        },
-    )
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    headers = {
+        "x-goog-api-key": key,
+        "Content-Type": "application/json",
+        "Api-Revision": "2026-05-20",
+    }
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
             return json.load(res)
@@ -57,24 +50,25 @@ def _api_request(method, url, key, payload=None, timeout=2.5):
         try:
             detail = json.loads(exc.read().decode("utf-8"))
             error = detail.get("error", {})
-            logging.warning(
-                "OpenAI API HTTP %s: %s — %s",
-                exc.code,
-                str(error.get("code") or error.get("type") or "unknown")[:80],
-                str(error.get("message") or "")[:300],
-            )
+            message = str(error.get("message") or "")
+            status = str(error.get("status") or error.get("code") or "unknown")
+            logging.warning("Gemini API HTTP %s (%s): %s", exc.code, status, message[:300])
         except (OSError, ValueError, AttributeError):
-            logging.warning("OpenAI API HTTP %s", exc.code)
-        if exc.code == 401:
-            raise OpenAIError("Ключ OpenAI API не принят.") from exc
-        if exc.code == 429:
-            raise OpenAIError("Сейчас достигнут лимит OpenAI API.") from exc
+            status, message = "unknown", ""
+            logging.warning("Gemini API HTTP %s", exc.code)
+
+        if exc.code == 400:
+            raise GeminiError("Gemini отклонил запрос. Проверьте настройки модели.") from exc
+        if exc.code == 401 or exc.code == 403:
+            raise GeminiError("Ключ Gemini API не принят или у него нет доступа.") from exc
         if exc.code == 404:
-            raise OpenAIError("Предыдущий ответ больше недоступен.") from exc
-        raise OpenAIError("Сервис ответов временно недоступен.") from exc
+            raise GeminiError("Запрошенный ответ или модель Gemini не найдены.") from exc
+        if exc.code == 429:
+            raise GeminiError("Сейчас достигнут бесплатный лимит Gemini API.") from exc
+        raise GeminiError("Сервис Gemini временно недоступен.") from exc
     except (OSError, ValueError) as exc:
-        logging.warning("OpenAI API request failed: %s", type(exc).__name__)
-        raise OpenAIError("Не удалось связаться с сервисом ответов.") from exc
+        logging.warning("Gemini API request failed: %s", type(exc).__name__)
+        raise GeminiError("Не удалось связаться с Gemini.") from exc
 
 
 def _needs_web_search(command):
@@ -89,46 +83,21 @@ def _needs_web_search(command):
 
 def _answer_text(data):
     parts = []
-    for item in data.get("output", []):
-        if item.get("type") != "message":
+    for step in data.get("steps", []):
+        if step.get("type") != "model_output":
             continue
-        for part in item.get("content", []):
-            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+        for part in step.get("content", []):
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
                 parts.append(part["text"])
     text = " ".join(parts)
-    text = re.sub(r"【[^】]{1,160}】|\ue200cite\ue202.*?\ue201", "", text)
-    text = re.sub(r"\[([^]]+)\]\(https?://[^)]+\)", r"\1", text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\s*\((?:[\w-]+\.)+[\w-]{2,}(?:/[^)]*)?\)", "", text)
     text = " ".join(text.split()).strip()
     if len(text) > MAX_ANSWER_CHARS:
         cut = text[:MAX_ANSWER_CHARS]
         sentence_end = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
-        text = cut[: sentence_end + 1] if sentence_end > 400 else cut.rstrip() + "…"
+        text = cut[:sentence_end + 1] if sentence_end > 400 else cut.rstrip() + "…"
     return text or "Ответ пока не получился. Попробуйте спросить иначе."
-
-
-def _source_buttons(data):
-    buttons = []
-    seen = set()
-    for item in data.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for part in item.get("content", []):
-            for annotation in part.get("annotations", []):
-                if annotation.get("type") != "url_citation":
-                    continue
-                citation = annotation.get("url_citation") or annotation
-                url = citation.get("url", "")
-                title = " ".join(str(citation.get("title") or "Источник").split())
-                parsed = urllib.parse.urlsplit(url)
-                if parsed.scheme != "https" or not parsed.netloc or len(url.encode("utf-8")) > 1024 or url in seen:
-                    continue
-                seen.add(url)
-                buttons.append({"title": ("Источник: " + title)[:64], "url": url, "hide": True})
-                if len(buttons) == 3:
-                    return buttons
-    return buttons
 
 
 def _say(text, state=None, end_session=False):
@@ -141,19 +110,26 @@ def _say(text, state=None, end_session=False):
     return result
 
 
+def _interaction_url(interaction_id):
+    return API_URL + "/" + urllib.parse.quote(interaction_id, safe="")
+
+
 def _finish(data):
     answer = _answer_text(data)
-    result = _say(answer, {"previous_response_id": data["id"]})
-    buttons = _source_buttons(data)
-    if buttons:
-        result["response"]["buttons"] = buttons
-    return result
+    interaction_id = data.get("id", "")
+    state = {"previous_interaction_id": interaction_id} if interaction_id else {}
+    return _say(answer, state)
+
+
+def _valid_interaction_id(value):
+    return isinstance(value, str) and value.startswith("v1_") and len(value) < 200
 
 
 def handler_alice(event, context):
     """Обработчик события Яндекс Диалогов."""
     del context
     start = time.monotonic()
+
     if not isinstance(event, dict):
         return _say("Не удалось прочитать запрос. Повторите, пожалуйста.")
 
@@ -163,8 +139,9 @@ def handler_alice(event, context):
     state = (event.get("state") or {}).get("session") or {}
     if not isinstance(state, dict):
         state = {}
-    previous_id = state.get("previous_response_id", "")
-    if not isinstance(previous_id, str) or not previous_id.startswith("resp_"):
+
+    previous_id = state.get("previous_interaction_id", "")
+    if not _valid_interaction_id(previous_id):
         previous_id = ""
 
     if command in ("хватит", "выход", "закончить", "стоп"):
@@ -178,84 +155,86 @@ def handler_alice(event, context):
             state,
         )
 
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
-        return _say("В навыке ещё не настроен ключ OpenAI API.")
+        return _say("В навыке ещё не настроен ключ Gemini API.")
 
-    pending = state.get("pending_response_id", "")
-    if pending:
+    pending_id = state.get("pending_interaction_id", "")
+    if pending_id:
+        if not _valid_interaction_id(pending_id):
+            return _say("Не удалось продолжить ответ. Повторите вопрос.", {})
         is_search = bool(state.get("pending_search"))
         waiting_text = (
             "Ещё ищу. Спросите «что нашлось?» через несколько секунд."
             if is_search else "Ещё думаю. Скажите «готово» через несколько секунд."
         )
-        response_id = pending
-        if not isinstance(response_id, str) or not response_id.startswith("resp_"):
-            return _say("Не удалось продолжить ответ. Повторите вопрос.", {})
-        url = API_URL + "/" + urllib.parse.quote(response_id, safe="")
         try:
-            data = _api_request("GET", url, key, timeout=2.4)
-        except OpenAIError as exc:
-            if "больше недоступен" in str(exc):
-                return _say(str(exc) + " Повторите вопрос.", {})
+            data = _api_request("GET", _interaction_url(pending_id), key, timeout=2.2)
+        except GeminiError as exc:
             return _say(str(exc) + " " + waiting_text, state)
-        if data.get("status") == "completed":
+
+        status = data.get("status")
+        if status == "completed":
             answer = _finish(data)
             if command not in ("", "готово", "ответ", "дальше", "ну что", *SEARCH_FOLLOWUP):
                 answer["response"]["text"] += " Повторите ваш новый вопрос."
             return answer
-        if data.get("status") in ("queued", "in_progress"):
+        if status in ("in_progress", "queued"):
             return _say(waiting_text, state)
         return _say("Получить ответ не удалось. Повторите вопрос.", {})
 
     if not utterance or command in ("готово", "ответ", "дальше", *SEARCH_FOLLOWUP):
         return _say("Здравствуйте! Задайте вопрос, и я постараюсь ответить.", state)
 
-    question = utterance[:1000]
     search = _needs_web_search(command)
     payload = {
         "model": MODEL,
-        "instructions": INSTRUCTIONS + (" " + SEARCH_PROMPT if search else ""),
-        "input": [{"role": "user", "content": question}],
-        "reasoning": {"effort": "none"},
-        "max_output_tokens": 220 if search else 120,
-        "background": search,
+        "input": utterance[:1000],
+        "system_instruction": INSTRUCTIONS + (" " + SEARCH_PROMPT if search else ""),
+        "background": True,
         "store": True,
+        "generation_config": {
+            "temperature": 0.4,
+            "thinking_level": "low",
+            "max_output_tokens": 220 if search else 120,
+        },
     }
     if search:
-        payload["tools"] = [{"type": "web_search", "search_context_size": "low"}]
-        payload["tool_choice"] = "required"
+        payload["tools"] = [{"type": "google_search"}]
     if previous_id:
-        payload["previous_response_id"] = previous_id
+        payload["previous_interaction_id"] = previous_id
+
     try:
-        data = _api_request("POST", API_URL, key, payload=payload, timeout=2.4 if search else 3.6)
+        data = _api_request("POST", API_URL, key, payload=payload, timeout=2.8)
         if data.get("status") == "completed":
             return _finish(data)
-        response_id = data.get("id", "")
-        if data.get("status") not in ("queued", "in_progress") or not response_id:
+
+        interaction_id = data.get("id", "")
+        if not _valid_interaction_id(interaction_id):
+            logging.warning("Gemini returned unexpected interaction response: %s", str(data)[:500])
             return _say("Получить ответ не удалось. Повторите вопрос.", state)
 
-        # Пока есть время, проверяем готовность без выхода за лимит Алисы.
-        url = API_URL + "/" + urllib.parse.quote(response_id, safe="")
-        while (remaining := OPENAI_TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.65:
+        # Проверяем готовность в пределах времени, доступного навыку Алисы.
+        url = _interaction_url(interaction_id)
+        while (remaining := TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.75:
             try:
-                ready = _api_request("GET", url, key, timeout=min(remaining - 0.25, 0.8))
+                ready = _api_request("GET", url, key, timeout=min(remaining - 0.2, 0.75))
                 if ready.get("status") == "completed":
                     return _finish(ready)
                 if ready.get("status") not in ("queued", "in_progress"):
                     break
-            except OpenAIError:
+            except GeminiError:
                 break
-            if (remaining := OPENAI_TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.9:
-                time.sleep(min(0.2, remaining - 0.7))
+            remaining = TIME_BUDGET_SECONDS - (time.monotonic() - start)
+            if remaining > 0.95:
+                time.sleep(min(0.18, remaining - 0.75))
+
         return _say(
             "Ищу информацию. Спросите «что нашлось?» через несколько секунд."
             if search else "Думаю над ответом. Скажите «готово» через несколько секунд.",
-            {"pending_response_id": response_id, "pending_search": search},
+            {"pending_interaction_id": interaction_id, "pending_search": search},
         )
-    except OpenAIError as exc:
-        if "больше недоступен" in str(exc):
-            return _say("Контекст беседы устарел. Скажите «сброс» и повторите вопрос.", state)
+    except GeminiError as exc:
         return _say(str(exc) + " Повторите вопрос позже.", state)
 
 
@@ -300,4 +279,3 @@ class handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass  # Не записывать секрет вебхука из URL в журнал приложения.
-
